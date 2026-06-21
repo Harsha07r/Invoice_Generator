@@ -1,359 +1,364 @@
 import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
-import { getSubtotal, getGSTAmount, getTotal, formatCurrency } from './calculations';
+import { getSubtotal, getGSTAmount, getTotal } from './calculations';
 import { formatDate } from './invoiceNumber';
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   DESIGN TOKENS
-   A4 = 210 × 297 mm  |  margin L/R = 14 mm  |  content width = 182 mm
+   CONSTANTS — A4 = 210 × 297 mm
 ───────────────────────────────────────────────────────────────────────────── */
-const PAGE_W   = 210;
-const PAGE_H   = 297;
-const ML       = 14;          // left margin
-const MR       = 14;          // right margin
-const CW       = PAGE_W - ML - MR;   // 182 mm content width
-const RIGHT    = PAGE_W - MR;        // 196 mm
+const PAGE_W = 210;
+const PAGE_H = 297;
+const ML     = 15;                   // left margin
+const MR     = 15;                   // right margin
+const CW     = PAGE_W - ML - MR;    // 180 mm usable width
+const RX     = PAGE_W - MR;         // 195 mm — right edge
 
-// Palette
-const BLUE     = [37, 99, 235];      // #2563eb  — single accent
-const BLUE_LT  = [239, 246, 255];    // #eff6ff  — accent light bg
-const DARK     = [15, 23, 42];       // #0f172a  — body text
-const MUTED    = [100, 116, 139];    // #64748b  — secondary text
-const BORDER   = [226, 232, 240];    // #e2e8f0  — subtle borders
-const STRIPE   = [248, 250, 252];    // #f8fafc  — zebra even rows
-const WHITE    = [255, 255, 255];
-const TOTAL_BG = [30, 64, 175];      // #1e40af  — grand total dark blue
+// Colour palette
+const C_BLUE     = [37,  99, 235];   // accent #2563eb
+const C_BLUE_DK  = [30,  64, 175];   // grand total bg #1e40af
+const C_DARK     = [17,  24,  39];   // near-black body
+const C_MUTED    = [107, 114, 128];  // grey labels
+const C_BORDER   = [229, 231, 235];  // table / box borders
+const C_STRIPE   = [249, 250, 251];  // zebra even row
+const C_HEADBG   = [243, 244, 246];  // section header bg
+const C_WHITE    = [255, 255, 255];
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   HELPERS
+   PDF-SAFE CURRENCY FORMATTER
+   jsPDF's built-in Helvetica (Latin-1) cannot render ₹  → use "Rs."
+   for USD/EUR the symbols work fine.
 ───────────────────────────────────────────────────────────────────────────── */
-function setFont(doc, size, style = 'normal', color = DARK) {
+function pdfMoney(amount, code = 'INR') {
+  const prefix  = { INR: 'Rs.', USD: '$', EUR: 'EUR' };
+  const locale  = { INR: 'en-IN', USD: 'en-US', EUR: 'de-DE' };
+  const pfx     = prefix[code] ?? 'Rs.';
+  const loc     = locale[code] ?? 'en-IN';
+  try {
+    const n = new Intl.NumberFormat(loc, {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    }).format(amount);
+    return `${pfx} ${n}`;
+  } catch {
+    return `${pfx} ${amount.toFixed(2)}`;
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   MICRO HELPERS
+───────────────────────────────────────────────────────────────────────────── */
+const sf = (doc, size, style = 'normal', color = C_DARK) => {
   doc.setFontSize(size);
   doc.setFont('helvetica', style);
   doc.setTextColor(...color);
-}
+};
 
-function hLine(doc, y, x1 = ML, x2 = RIGHT, color = BORDER, w = 0.25) {
+const hRule = (doc, y, color = C_BORDER, lw = 0.25, x1 = ML, x2 = RX) => {
   doc.setDrawColor(...color);
-  doc.setLineWidth(w);
+  doc.setLineWidth(lw);
   doc.line(x1, y, x2, y);
-}
-
-function labelValue(doc, label, value, x, y, labelW = 22) {
-  setFont(doc, 7.5, 'normal', MUTED);
-  doc.text(label, x, y);
-  setFont(doc, 8.5, 'normal', DARK);
-  doc.text(value || '—', x + labelW, y);
-}
+};
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   MAIN GENERATOR
+   MAIN EXPORT
 ───────────────────────────────────────────────────────────────────────────── */
 export function generatePDF(invoiceData) {
   const { seller, buyer, invoice, items, gstRate, currency } = invoiceData;
 
-  const subtotal  = getSubtotal(items);
-  const gstAmount = getGSTAmount(subtotal, gstRate);
-  const total     = getTotal(subtotal, gstAmount);
+  const sub  = getSubtotal(items);
+  const gst  = getGSTAmount(sub, gstRate);
+  const tot  = getTotal(sub, gst);
 
   const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
 
-  /* ── 1. WHITE PAGE BASE ─────────────────────────────────────────────────── */
-  doc.setFillColor(...WHITE);
+  // White base
+  doc.setFillColor(...C_WHITE);
   doc.rect(0, 0, PAGE_W, PAGE_H, 'F');
 
-  /* ══════════════════════════════════════════════════════════════════════════
-     HEADER  (y: 10 → ~52)   ≈ 14% of page height
-  ══════════════════════════════════════════════════════════════════════════ */
+  /* ════════════════════════════════════════════════════════════════════════
+     SECTION 1 — HEADER  (y 12 → ~54)
+  ════════════════════════════════════════════════════════════════════════ */
   let y = 12;
 
-  /* Left: Logo */
+  /* ── Left: Logo ── */
   if (seller.logo) {
     try {
       const fmt = seller.logo.startsWith('data:image/png') ? 'PNG' : 'JPEG';
-      // Logo box 28×20 mm
-      doc.addImage(seller.logo, fmt, ML, y, 28, 20, undefined, 'FAST');
+      // Clean white-bg box for logo
+      doc.setFillColor(...C_WHITE);
+      doc.setDrawColor(...C_BORDER);
+      doc.setLineWidth(0.3);
+      doc.roundedRect(ML, y, 26, 20, 2, 2, 'FD');
+      doc.addImage(seller.logo, fmt, ML + 1, y + 1, 24, 18, undefined, 'FAST');
     } catch {
-      _drawLogoPlaceholder(doc, ML, y);
+      drawDefaultLogo(doc, ML, y);
     }
   } else {
-    _drawLogoPlaceholder(doc, ML, y);
+    drawDefaultLogo(doc, ML, y);
   }
 
-  /* Left: Business info below logo */
-  const infoY = y + 24;
-  setFont(doc, 10, 'bold', DARK);
-  doc.text(seller.businessName || 'Your Business', ML, infoY);
+  /* ── Left: Seller details below logo ── */
+  let sy = y + 25;
+  sf(doc, 11, 'bold', C_DARK);
+  doc.text(seller.businessName || 'Your Business', ML, sy);
 
-  setFont(doc, 7.5, 'normal', MUTED);
-  let infoLine = infoY + 4.5;
-  if (seller.email)   { doc.text(seller.email,  ML, infoLine); infoLine += 4; }
-  if (seller.phone)   { doc.text(seller.phone,  ML, infoLine); infoLine += 4; }
+  sf(doc, 7.5, 'normal', C_MUTED);
+  sy += 5;
+  if (seller.email)   { doc.text(seller.email,   ML, sy); sy += 4; }
+  if (seller.phone)   { doc.text(seller.phone,   ML, sy); sy += 4; }
   if (seller.address) {
-    const lines = doc.splitTextToSize(seller.address, 70);
-    lines.slice(0, 2).forEach(l => { doc.text(l, ML, infoLine); infoLine += 4; });
+    const ln = doc.splitTextToSize(seller.address, 72);
+    ln.slice(0, 2).forEach(l => { doc.text(l, ML, sy); sy += 4; });
   }
   if (seller.gstNumber) {
-    setFont(doc, 7, 'normal', MUTED);
-    doc.text(`GSTIN: ${seller.gstNumber}`, ML, infoLine);
+    sf(doc, 7, 'normal', C_MUTED);
+    doc.text(`GSTIN: ${seller.gstNumber}`, ML, sy);
   }
 
-  /* Right: INVOICE title block */
-  setFont(doc, 28, 'bold', BLUE);
-  doc.text('INVOICE', RIGHT, y + 8, { align: 'right' });
+  /* ── Right: INVOICE heading + meta ──────────────────────────────────── */
+  // "INVOICE" — large, blue, top-right
+  sf(doc, 30, 'bold', C_BLUE);
+  doc.text('INVOICE', RX, y + 10, { align: 'right' });
 
-  setFont(doc, 8, 'bold', DARK);
-  doc.text('Invoice No.', RIGHT - 38, y + 16);
-  setFont(doc, 8, 'normal', MUTED);
-  doc.text(invoice.number || 'INV-000001', RIGHT, y + 16, { align: 'right' });
+  // Thin blue underline beneath heading
+  doc.setFillColor(...C_BLUE);
+  doc.rect(RX - 52, y + 13, 52, 0.8, 'F');
 
-  setFont(doc, 8, 'bold', DARK);
-  doc.text('Invoice Date', RIGHT - 38, y + 22);
-  setFont(doc, 8, 'normal', MUTED);
-  doc.text(formatDate(invoice.date) || '—', RIGHT, y + 22, { align: 'right' });
+  // Meta block — label left, value right, stacked rows
+  // Use left-edge of meta block at x=128, right edge at RX=195
+  const META_L = 128;  // label column x
+  const META_R = RX;   // value right-align x
 
-  setFont(doc, 8, 'bold', DARK);
-  doc.text('Due Date', RIGHT - 38, y + 28);
-  setFont(doc, 8, 'normal', MUTED);
-  doc.text(formatDate(invoice.dueDate) || '—', RIGHT, y + 28, { align: 'right' });
+  const metaRows = [
+    ['Invoice No.',   invoice.number  || '—'],
+    ['Invoice Date',  formatDate(invoice.date)  || '—'],
+    ['Due Date',      formatDate(invoice.dueDate) || '—'],
+  ];
 
-  /* Accent bar under "INVOICE" */
-  doc.setFillColor(...BLUE);
-  doc.rect(RIGHT - 50, y + 32, 50, 1, 'F');
+  let my = y + 21;
+  metaRows.forEach(([label, value]) => {
+    sf(doc, 7.5, 'bold', C_DARK);
+    doc.text(label, META_L, my);
+    sf(doc, 7.5, 'normal', C_MUTED);
+    doc.text(value, META_R, my, { align: 'right' });
+    my += 6;
+  });
 
-  /* ── Header separator ── */
-  y = 56;
-  hLine(doc, y, ML, RIGHT, BORDER, 0.4);
+  /* ── Header bottom rule ── */
+  const headerBottom = Math.max(sy + 4, my + 2, 55);
+  hRule(doc, headerBottom, C_BORDER, 0.4);
 
-  /* ══════════════════════════════════════════════════════════════════════════
-     CLIENT INFO  (y: 60 → 94)
-  ══════════════════════════════════════════════════════════════════════════ */
-  y = 60;
-  const colMid  = ML + CW / 2 + 4;  // 105 mm  — right column start
-  const colW    = CW / 2 - 4;       // 87 mm each column
+  /* ════════════════════════════════════════════════════════════════════════
+     SECTION 2 — BILL TO / FROM  (two equal columns)
+  ════════════════════════════════════════════════════════════════════════ */
+  y = headerBottom + 6;
+  const colW = (CW - 5) / 2;       // ~87.5 mm each
+  const col2 = ML + colW + 5;       // right column x start
 
-  /* Left bg box */
-  doc.setFillColor(...STRIPE);
-  doc.setDrawColor(...BORDER);
+  // Left box — Bill To
+  doc.setFillColor(...C_STRIPE);
+  doc.setDrawColor(...C_BORDER);
   doc.setLineWidth(0.2);
-  doc.roundedRect(ML, y, colW, 32, 2, 2, 'FD');
+  doc.roundedRect(ML, y, colW, 34, 2, 2, 'FD');
 
-  /* Right bg box */
-  doc.roundedRect(colMid, y, colW, 32, 2, 2, 'FD');
+  // Right box — From
+  doc.roundedRect(col2, y, colW, 34, 2, 2, 'FD');
 
-  /* "BILL TO" label */
-  setFont(doc, 6.5, 'bold', BLUE);
-  doc.text('BILL TO', ML + 4, y + 5.5);
+  // Bill To content
+  sf(doc, 6.5, 'bold', C_BLUE);
+  doc.text('BILL TO', ML + 4, y + 6);
 
-  setFont(doc, 9, 'bold', DARK);
-  doc.text(buyer.clientName || '—', ML + 4, y + 11);
-  setFont(doc, 7.5, 'normal', MUTED);
-  let bY = y + 16;
+  sf(doc, 9, 'bold', C_DARK);
+  doc.text(buyer.clientName || '—', ML + 4, y + 12);
+
+  sf(doc, 7.5, 'normal', C_MUTED);
+  let by = y + 17.5;
   if (buyer.clientEmail) {
-    doc.text(buyer.clientEmail, ML + 4, bY);
-    bY += 4.5;
+    doc.text(buyer.clientEmail, ML + 4, by); by += 4.5;
   }
   if (buyer.clientAddress) {
-    const addrLines = doc.splitTextToSize(buyer.clientAddress, colW - 8);
-    addrLines.slice(0, 3).forEach(l => { doc.text(l, ML + 4, bY); bY += 4; });
+    const ln = doc.splitTextToSize(buyer.clientAddress, colW - 8);
+    ln.slice(0, 2).forEach(l => { doc.text(l, ML + 4, by); by += 4; });
   }
 
-  /* "FROM" label */
-  setFont(doc, 6.5, 'bold', BLUE);
-  doc.text('FROM', colMid + 4, y + 5.5);
+  // From content
+  sf(doc, 6.5, 'bold', C_BLUE);
+  doc.text('FROM', col2 + 4, y + 6);
 
-  setFont(doc, 9, 'bold', DARK);
-  doc.text(seller.businessName || '—', colMid + 4, y + 11);
-  setFont(doc, 7.5, 'normal', MUTED);
-  let fY = y + 16;
-  if (seller.email) { doc.text(seller.email, colMid + 4, fY); fY += 4.5; }
+  sf(doc, 9, 'bold', C_DARK);
+  doc.text(seller.businessName || '—', col2 + 4, y + 12);
+
+  sf(doc, 7.5, 'normal', C_MUTED);
+  let fy = y + 17.5;
+  if (seller.email) { doc.text(seller.email, col2 + 4, fy); fy += 4.5; }
   if (seller.address) {
-    const sLines = doc.splitTextToSize(seller.address, colW - 8);
-    sLines.slice(0, 2).forEach(l => { doc.text(l, colMid + 4, fY); fY += 4; });
+    const ln = doc.splitTextToSize(seller.address, colW - 8);
+    ln.slice(0, 2).forEach(l => { doc.text(l, col2 + 4, fy); fy += 4; });
   }
   if (seller.gstNumber) {
-    setFont(doc, 7, 'normal', MUTED);
-    doc.text(`GSTIN: ${seller.gstNumber}`, colMid + 4, fY);
+    sf(doc, 7, 'normal', C_MUTED);
+    doc.text(`GSTIN: ${seller.gstNumber}`, col2 + 4, fy);
   }
 
-  /* ══════════════════════════════════════════════════════════════════════════
-     ITEMS TABLE   (starts at y: ~96)
-  ══════════════════════════════════════════════════════════════════════════ */
-  const tableStartY = y + 36;
+  /* ════════════════════════════════════════════════════════════════════════
+     SECTION 3 — LINE ITEMS TABLE
+     Columns total = 180 mm (= CW)
+       #    10  center
+       Desc 82  left
+       Qty  16  center
+       Rate 36  right
+       Amt  36  right
+  ════════════════════════════════════════════════════════════════════════ */
+  const tableY = y + 40;
 
   const validItems = items.filter(i => i.description || i.qty || i.rate);
-  const tableBody  = validItems.length > 0
+  const rows = validItems.length > 0
     ? validItems.map((item, idx) => {
-        const qty    = parseFloat(item.qty)  || 0;
-        const rate   = parseFloat(item.rate) || 0;
-        const amount = qty * rate;
-        return [
-          idx + 1,
-          item.description || '',
-          qty.toString(),
-          formatCurrency(rate,   currency),
-          formatCurrency(amount, currency),
-        ];
+        const q   = parseFloat(item.qty)  || 0;
+        const r   = parseFloat(item.rate) || 0;
+        const amt = q * r;
+        return [idx + 1, item.description || '', q, pdfMoney(r, currency), pdfMoney(amt, currency)];
       })
-    : [[1, 'No items added', '0', formatCurrency(0, currency), formatCurrency(0, currency)]];
+    : [[1, 'No items added yet', 0, pdfMoney(0, currency), pdfMoney(0, currency)]];
 
   autoTable(doc, {
-    startY:  tableStartY,
-    head:    [['#', 'Description', 'Qty', 'Unit Rate', 'Amount']],
-    body:    tableBody,
-    margin:  { left: ML, right: MR },
-    tableWidth: 'auto',
+    startY:    tableY,
+    head:      [['#', 'Description', 'Qty', 'Unit Rate', 'Amount']],
+    body:      rows,
+    margin:    { left: ML, right: MR },
+    tableWidth: CW,
 
     styles: {
-      font:      'helvetica',
-      fontSize:  8.5,
-      cellPadding: { top: 4, bottom: 4, left: 4, right: 4 },
-      textColor: DARK,
-      lineColor: BORDER,
-      lineWidth: 0.2,
+      font:         'helvetica',
+      fontSize:     8.5,
+      textColor:    C_DARK,
+      lineColor:    C_BORDER,
+      lineWidth:    0.2,
+      overflow:     'linebreak',
+      cellPadding:  { top: 4, bottom: 4, left: 4, right: 4 },
     },
 
     headStyles: {
-      fillColor:  BLUE,
-      textColor:  WHITE,
-      fontStyle:  'bold',
-      fontSize:   8,
-      cellPadding: { top: 4.5, bottom: 4.5, left: 4, right: 4 },
-      halign:     'left',
+      fillColor:    C_BLUE,
+      textColor:    C_WHITE,
+      fontStyle:    'bold',
+      fontSize:     8,
+      halign:       'left',
+      cellPadding:  { top: 5, bottom: 5, left: 4, right: 4 },
     },
 
-    alternateRowStyles: {
-      fillColor: STRIPE,
-    },
-
-    bodyStyles: {
-      fillColor: WHITE,
-    },
+    alternateRowStyles: { fillColor: C_STRIPE },
+    bodyStyles:         { fillColor: C_WHITE },
 
     columnStyles: {
-      0: { cellWidth: 10, halign: 'center', textColor: MUTED, fontSize: 8 },
-      1: { cellWidth: 'auto' },
-      2: { cellWidth: 18,  halign: 'center' },
-      3: { cellWidth: 38,  halign: 'right' },
-      4: { cellWidth: 38,  halign: 'right', fontStyle: 'bold' },
+      0: { cellWidth: 10, halign: 'center', textColor: C_MUTED, fontSize: 8 },
+      1: { cellWidth: 80, halign: 'left' },
+      2: { cellWidth: 16, halign: 'center' },
+      3: { cellWidth: 37, halign: 'right' },
+      4: { cellWidth: 37, halign: 'right', fontStyle: 'bold' },
     },
+
+    // Draw right-border on each cell to act as column separator
+    didParseCell: () => {},
   });
 
-  /* ══════════════════════════════════════════════════════════════════════════
-     TOTALS  (bottom-right, after table)
-  ══════════════════════════════════════════════════════════════════════════ */
-  const afterTable = doc.lastAutoTable.finalY + 6;
-  const totalsX    = RIGHT - 72;        // left edge of totals box
-  const totalsW    = 72;
-  const rowH       = 7;
+  /* ════════════════════════════════════════════════════════════════════════
+     SECTION 4 — TOTALS (right-aligned) + NOTES (left)
+  ════════════════════════════════════════════════════════════════════════ */
+  const afterY   = doc.lastAutoTable.finalY + 8;
+  const TOT_W    = 76;          // totals block width
+  const TOT_X    = RX - TOT_W; // left edge of totals block = 119
 
-  // Subtotal row
-  let tY = afterTable;
-  doc.setFillColor(...WHITE);
-  doc.setDrawColor(...BORDER);
-  doc.setLineWidth(0.2);
+  /* Subtotal row */
+  let ty = afterY;
+  drawTotalsRow(doc, 'Subtotal', pdfMoney(sub, currency), TOT_X, ty, TOT_W, false);
+  ty += 7.5;
 
-  _totalsRow(doc, 'Subtotal',       formatCurrency(subtotal,  currency), totalsX, tY, totalsW, rowH, false);
-  tY += rowH;
-  _totalsRow(doc, `GST (${gstRate}%)`, formatCurrency(gstAmount, currency), totalsX, tY, totalsW, rowH, false);
-  tY += rowH;
+  /* GST row */
+  drawTotalsRow(doc, `GST (${gstRate}%)`, pdfMoney(gst, currency), TOT_X, ty, TOT_W, false);
+  ty += 7.5;
 
-  // Thin divider above grand total
-  doc.setDrawColor(...BORDER);
-  doc.setLineWidth(0.25);
-  doc.line(totalsX, tY, RIGHT, tY);
+  /* Divider */
+  hRule(doc, ty, C_BORDER, 0.25, TOT_X, RX);
+  ty += 2;
 
-  // Grand Total — blue background
-  tY += 0.5;
-  doc.setFillColor(...TOTAL_BG);
-  doc.roundedRect(totalsX, tY, totalsW, rowH + 2, 2, 2, 'F');
+  /* Grand Total — dark blue bg */
+  doc.setFillColor(...C_BLUE_DK);
+  doc.roundedRect(TOT_X, ty, TOT_W, 10, 2, 2, 'F');
+  sf(doc, 9, 'bold', C_WHITE);
+  doc.text('Grand Total', TOT_X + 4, ty + 6.5);
+  sf(doc, 9.5, 'bold', C_WHITE);
+  doc.text(pdfMoney(tot, currency), RX - 4, ty + 6.5, { align: 'right' });
 
-  setFont(doc, 8.5, 'bold', WHITE);
-  doc.text('Grand Total', totalsX + 4, tY + 5.5);
-  setFont(doc, 9.5, 'bold', WHITE);
-  doc.text(formatCurrency(total, currency), RIGHT - 3, tY + 5.5, { align: 'right' });
-
-  /* ══════════════════════════════════════════════════════════════════════════
-     NOTES & TERMS   (left side, same vertical zone as totals)
-  ══════════════════════════════════════════════════════════════════════════ */
+  /* ── Notes & Terms (left side, same y zone) ── */
   const notesX = ML;
-  const notesY = afterTable;
-  const notesW = totalsX - ML - 8;
+  const notesW = TOT_X - ML - 8;
+  let   ny     = afterY;
 
-  setFont(doc, 7.5, 'bold', DARK);
-  doc.text('Notes', notesX, notesY + 4);
-  setFont(doc, 7.5, 'normal', MUTED);
-  doc.text('Thank you for your business.', notesX, notesY + 9);
+  sf(doc, 8, 'bold', C_DARK);
+  doc.text('Notes', notesX, ny + 4);
+  sf(doc, 7.5, 'normal', C_MUTED);
+  doc.text('Thank you for your business.', notesX, ny + 9);
 
-  setFont(doc, 7.5, 'bold', DARK);
-  doc.text('Terms & Conditions', notesX, notesY + 16);
-  setFont(doc, 7.5, 'normal', MUTED);
-  const terms = doc.splitTextToSize('Payment due within 30 days of the invoice date. Please include the invoice number in your payment reference.', notesW);
+  ny += 16;
+  sf(doc, 8, 'bold', C_DARK);
+  doc.text('Terms & Conditions', notesX, ny);
+  sf(doc, 7.5, 'normal', C_MUTED);
+  const terms = doc.splitTextToSize(
+    'Payment due within 30 days of the invoice date. Please include the invoice number in your payment reference.',
+    notesW
+  );
   terms.slice(0, 3).forEach((line, i) => {
-    doc.text(line, notesX, notesY + 21 + i * 4);
+    doc.text(line, notesX, ny + 5 + i * 4.5);
   });
 
-  /* Bank / Payment details hint */
-  setFont(doc, 7, 'normal', MUTED);
-
-  /* ══════════════════════════════════════════════════════════════════════════
-     FOOTER
-  ══════════════════════════════════════════════════════════════════════════ */
+  /* ════════════════════════════════════════════════════════════════════════
+     SECTION 5 — FOOTER
+  ════════════════════════════════════════════════════════════════════════ */
   const footerY = PAGE_H - 10;
-
-  hLine(doc, footerY - 5, ML, RIGHT, BORDER, 0.25);
-
-  setFont(doc, 6.5, 'normal', MUTED);
+  hRule(doc, footerY - 5, C_BORDER, 0.25);
+  sf(doc, 6.5, 'normal', C_MUTED);
   doc.text('Generated using InvoiceForge', ML, footerY);
-  doc.text('Built for Digital Heroes  ·  digitalheroesco.com', RIGHT, footerY, { align: 'right' });
-
-  // Page number center
-  setFont(doc, 6.5, 'normal', MUTED);
-  doc.text(`Page 1 of 1`, PAGE_W / 2, footerY, { align: 'center' });
+  doc.text('Page 1 of 1', PAGE_W / 2, footerY, { align: 'center' });
+  doc.text('Built for Digital Heroes  ·  digitalheroesco.com', RX, footerY, { align: 'right' });
 
   /* ── Save ── */
   doc.save(`${invoice.number || 'invoice'}.pdf`);
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   PRIVATE: Logo placeholder box
+   PRIVATE: Clean minimal logo placeholder
 ───────────────────────────────────────────────────────────────────────────── */
-function _drawLogoPlaceholder(doc, x, y) {
-  doc.setFillColor(37, 99, 235, 0.08);
-  doc.setDrawColor(...[37, 99, 235]);
-  doc.setLineWidth(0.4);
-  doc.roundedRect(x, y, 28, 20, 3, 3, 'FD');
+function drawDefaultLogo(doc, x, y) {
+  // Outer rounded square — white fill, blue stroke
+  doc.setFillColor(239, 246, 255);           // very light blue bg
+  doc.setDrawColor(...C_BLUE);
+  doc.setLineWidth(0.6);
+  doc.roundedRect(x, y, 26, 20, 3, 3, 'FD');
 
-  doc.setFontSize(13);
+  // Top accent bar inside box
+  doc.setFillColor(...C_BLUE);
+  doc.rect(x, y, 26, 4, 'F');
+
+  // "IF" initials — white on blue bar
   doc.setFont('helvetica', 'black');
-  doc.setTextColor(37, 99, 235);
-  doc.text('IF', x + 14, y + 10, { align: 'center', baseline: 'middle' });
+  doc.setFontSize(9);
+  doc.setTextColor(...C_WHITE);
+  doc.text('IF', x + 13, y + 3.2, { align: 'center', baseline: 'middle' });
 
-  doc.setFontSize(5.5);
+  // "INVOICE FORGE" subtitle — blue text on light bg
   doc.setFont('helvetica', 'bold');
-  doc.text('INVOICE FORGE', x + 14, y + 16, { align: 'center' });
+  doc.setFontSize(4.5);
+  doc.setTextColor(...C_BLUE);
+  doc.text('INVOICE FORGE', x + 13, y + 14, { align: 'center' });
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   PRIVATE: Single totals row
+   PRIVATE: Totals row (label + right-aligned value)
 ───────────────────────────────────────────────────────────────────────────── */
-function _totalsRow(doc, label, value, x, y, w, h, highlighted) {
-  if (highlighted) {
-    doc.setFillColor(...BLUE_LT);
-    doc.rect(x, y, w, h, 'F');
-  }
-
-  const BLUE_LT = [239, 246, 255];
-
-  // Label
-  doc.setFontSize(8);
-  doc.setFont('helvetica', highlighted ? 'bold' : 'normal');
-  doc.setTextColor(...(highlighted ? BLUE : MUTED));
-  doc.text(label, x + 4, y + 4.8);
-
-  // Value
-  doc.setFontSize(8);
-  doc.setFont('helvetica', highlighted ? 'bold' : 'normal');
-  doc.setTextColor(...(highlighted ? BLUE : [15, 23, 42]));
-  doc.text(value, x + w - 3, y + 4.8, { align: 'right' });
+function drawTotalsRow(doc, label, value, x, y, w, _highlighted) {
+  sf(doc, 8, 'normal', C_MUTED);
+  doc.text(label, x + 4, y + 5);
+  sf(doc, 8.5, 'bold', C_DARK);
+  doc.text(value, x + w - 4, y + 5, { align: 'right' });
 }
